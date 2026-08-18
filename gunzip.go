@@ -113,6 +113,11 @@ type Header struct {
 // have the expected length or checksum. Clients should treat data
 // returned by Read as tentative until they receive the io.EOF
 // marking the end of the data.
+//
+// The length and checksum can only be verified if every byte of the
+// uncompressed data has been decompressed by this Reader. Seeking with a
+// pre-loaded Index skips over data without decompressing it, so a Reader that
+// has done so reaches io.EOF without performing the check.
 type Reader struct {
 	Header // valid after NewReader
 	Index  // valid after NewReader
@@ -127,6 +132,7 @@ type Reader struct {
 
 	pos           int64 // Current offset of Read() within the uncompressed data.
 	furthestRead  int64
+	gaplessRead   bool // true, if every byte up to furthestRead has actually been decompressed by this Reader.
 	checkedDigest bool
 	indexInterval int64
 }
@@ -163,6 +169,7 @@ func NewReaderInterval(r io.ReadSeeker, indexInterval int64) (*Reader, error) {
 		}},
 		r:             r,
 		bufR:          bufR,
+		gaplessRead:   true,
 		indexInterval: indexInterval,
 	}
 	z.Header, z.err = z.readHeader()
@@ -282,14 +289,22 @@ func (z *Reader) Read(p []byte) (n int, err error) {
 
 	n, z.err = z.decompressor.Read(p)
 
+	posBefore := z.pos
 	z.pos += int64(n)
 	// Is this read past the furthest point we have read before?
 	// If so then update size/digest with new data.
 	if z.pos > z.furthestRead {
-		startIdx := z.furthestRead - (z.pos - int64(n))
-		newData := p[startIdx:n]
-		z.digest = crc32.Update(z.digest, crc32.IEEETable, newData)
-		z.size += uint32(len(newData))
+		if posBefore > z.furthestRead {
+			// Seeking to a Point of the Index jumped over data that was
+			// never decompressed by this Reader.
+			z.gaplessRead = false
+		} else {
+			startIdx := z.furthestRead - posBefore
+			newData := p[startIdx:n]
+			z.digest = crc32.Update(z.digest, crc32.IEEETable, newData)
+			z.size += uint32(len(newData))
+		}
+
 		z.furthestRead = z.pos
 	}
 	if z.pos >= z.Index.lastUncompressedOffset()+z.indexInterval {
@@ -310,7 +325,7 @@ func (z *Reader) Read(p []byte) (n int, err error) {
 	}
 	digest := le.Uint32(z.buf[:4])
 	size := le.Uint32(z.buf[4:8])
-	if digest != z.digest || size != z.size {
+	if z.gaplessRead && (digest != z.digest || size != z.size) {
 		z.err = ErrChecksum
 		return n, z.err
 	}
@@ -339,6 +354,10 @@ func (z *Reader) addPointToIndex() {
 // of offsets as it does so. Subsequent calls to seek will use the index to skip
 // data more efficiently. Seeking from the end of the file is not implemented
 // and will return ErrUnimplementedSeek.
+//
+// Seeking over data that this Reader has not decompressed, which is possible
+// with an Index assigned from a previous Reader, permanently disables the
+// checksum and length verification that would otherwise happen at io.EOF.
 func (z *Reader) Seek(offset int64, whence int) (position int64, err error) {
 	switch whence {
 	case io.SeekStart:

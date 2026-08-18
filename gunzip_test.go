@@ -420,8 +420,10 @@ func TestTruncatedStreams(t *testing.T) {
 	}
 }
 
-const seekTestData = "testdata/Isaac.Newton-Opticks.txt"
-const seekTestInterval = 16 * 1024
+const (
+	seekTestData     = "testdata/Isaac.Newton-Opticks.txt"
+	seekTestInterval = 16 * 1024
+)
 
 func makeGzipTestData(t *testing.T, path string) []byte {
 	f, err := os.Open(path)
@@ -670,4 +672,86 @@ func equalBytes(b1, b2 []byte) bool {
 	}
 
 	return true
+}
+
+func TestSeekForwardWithReloadedIndex(t *testing.T) {
+	compressed := makeGzipTestData(t, seekTestData)
+
+	gzr, err := NewReaderInterval(bytes.NewReader(compressed), seekTestInterval)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read all data to end of file to build the Index.
+	if _, err := io.Copy(io.Discard, gzr); err != nil {
+		t.Fatal(err)
+	}
+
+	var b bytes.Buffer
+	if err := gzr.Index.WriteTo(&b); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gzr.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	index, err := LoadIndex(&b)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gzr, err = NewReaderInterval(bytes.NewReader(compressed), seekTestInterval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gzr.Index = index
+
+	testSeekPoints(t, gzr)
+
+	// Reading on to the end of the file must not report a checksum error.
+	if _, err := io.Copy(io.Discard, gzr); err != nil {
+		t.Errorf("read to EOF after seeking with a reloaded Index: %v", err)
+	}
+}
+
+func TestChecksumIsVerified(t *testing.T) {
+	compressed := makeGzipTestData(t, seekTestData)
+
+	corrupted := append([]byte(nil), compressed...)
+	// The last 8 bytes of a gzip member are the CRC32 and ISIZE fields.
+	corrupted[len(corrupted)-8] ^= 0xff
+
+	gzr, err := NewReader(bytes.NewReader(corrupted))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := io.Copy(ioutil.Discard, gzr); err != ErrChecksum {
+		t.Errorf("reading a stream with a corrupted checksum: err = %v, want %v", err, ErrChecksum)
+	}
+}
+
+func TestChecksumIsVerifiedAfterSeekWithinReadData(t *testing.T) {
+	compressed := makeGzipTestData(t, seekTestData)
+
+	corrupted := append([]byte(nil), compressed...)
+	corrupted[len(corrupted)-8] ^= 0xff
+
+	gzr, err := NewReaderInterval(bytes.NewReader(corrupted), seekTestInterval)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := io.Copy(ioutil.Discard, gzr); err != ErrChecksum {
+		t.Fatalf("reading a stream with a corrupted checksum: err = %v, want %v", err, ErrChecksum)
+	}
+
+	if _, err := gzr.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := io.Copy(ioutil.Discard, gzr); err != ErrChecksum {
+		t.Errorf("re-reading a stream with a corrupted checksum: err = %v, want %v", err, ErrChecksum)
+	}
 }
